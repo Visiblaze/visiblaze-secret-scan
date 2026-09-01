@@ -1,0 +1,27 @@
+Visiblaze secret scan
+Copyright 2026 Visiblaze
+
+This product includes software developed at Visiblaze (https://visiblaze.com).
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file for the
+full terms.
+
+This licence covers the contents of this repository — the composite action and
+its pin manifest. It does not grant any right to the Visiblaze platform or its
+APIs, which are provided under a separate commercial agreement.
+
+
+THIRD-PARTY SOFTWARE
+--------------------
+
+None.
+
+This action downloads and executes exactly one binary, ours, verified against a
+digest pinned in pins.env before it runs. It bundles nothing, and it fetches
+nothing from any third party at run time.
+
+That is a deliberate difference from the Visiblaze SAST action, which downloads
+Opengrep and therefore also downloads cosign to verify Opengrep's signature.
+Credential detection is regular expressions over text, so implementing it in our
+own scanner leaves one artefact to trust instead of three — and no upstream
+project whose release process could change under us.

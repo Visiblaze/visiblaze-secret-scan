@@ -1,0 +1,318 @@
+# Visiblaze secret scan — finds credentials committed to a repository, on your own runner.
+#
+# ── What leaves your runner ──
+#
+# Rule id, severity, file path, line number, and a REDACTED, length-bounded fragment of the
+# matching line. Never the credential. Never the file. Never the repository.
+#
+# That is not a policy statement about what we promise to discard — the detection runs here, and
+# the value is masked before it is placed in any structure that is later serialised, logged or
+# transmitted.
+#
+# Masking is a property of the LINE, not of one finding: every secret detected anywhere on a line
+# is masked in every finding reporting it, so two credentials sharing a line cannot leak each
+# other. Redaction used to be per-match, and each finding shipped the other's secret in full.
+# The residual is a credential type no rule detects, which is why the fragment is bounded rather
+# than being the whole line. For every other analysis Visiblaze fetches a tarball and scans it centrally; for
+# credentials that is the least defensible version of the same design, because the artefact being
+# copied IS the key.
+#
+# ── What this costs you ──
+#
+# One binary download (~9 MB) and a pass over your text files. No third-party scanner, so no
+# second download and no signature chain to verify — see pins.env.
+name: Visiblaze secret scan
+description: Detect credentials committed to this repository. Detection runs on your runner; only redacted findings are sent.
+author: Visiblaze
+
+inputs:
+  tenant:
+    description: Visiblaze tenant id the findings belong to.
+    required: true
+  api-url:
+    description: Full Visiblaze ingest endpoint for credential findings.
+    required: true
+  repo-key:
+    description: Repository key, "<provider>#<external_id>". Derived from the GitHub context when empty.
+    required: false
+    default: ''
+  path:
+    description: Directory to scan, relative to the checkout.
+    required: false
+    default: '.'
+  scope:
+    description: Comma-separated repository-relative paths this run covers. Empty means the whole repository.
+    required: false
+    default: ''
+  fail-on:
+    description: Fail the step when a finding is at or above this severity (critical|high|medium|low). Empty never fails on findings.
+    required: false
+    default: ''
+  fail-on-error:
+    description: Fail the step if the scan itself could not run. Default false, so an outage on our side does not break your build.
+    required: false
+    default: 'false'
+  dry-run:
+    description: Scan and print what would be sent, upload nothing.
+    required: false
+    default: 'false'
+
+outputs:
+  status:
+    description: complete | failed
+    value: ${{ steps.scan.outputs.status }}
+  findings:
+    description: Number of credential findings detected. Empty if the scan did not run — check `status` before treating it as a number.
+    value: ${{ steps.scan.outputs.findings }}
+  actionable:
+    description: Findings not downgraded as test code. This is the number a policy acts on.
+    value: ${{ steps.scan.outputs.actionable }}
+  files-read:
+    description: Files actually opened and scanned. The coverage claim — a repository with no findings and one never scanned both report zero.
+    value: ${{ steps.scan.outputs.files_read }}
+  lines-truncated:
+    description: Lines too long to scan whole. Non-zero means part of the repository was not examined.
+    value: ${{ steps.scan.outputs.lines_truncated }}
+
+runs:
+  using: composite
+  steps:
+    - id: scan
+      shell: bash
+      env:
+        IN_TENANT: ${{ inputs.tenant }}
+        IN_API: ${{ inputs.api-url }}
+        IN_REPO_KEY: ${{ inputs.repo-key }}
+        IN_PATH: ${{ inputs.path }}
+        IN_SCOPE: ${{ inputs.scope }}
+        IN_FAIL_ON: ${{ inputs.fail-on }}
+        IN_FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
+        IN_DRY_RUN: ${{ inputs.dry-run }}
+        ACTION_PATH: ${{ github.action_path }}
+        GH_REPO_ID: ${{ github.repository_id }}
+        GH_REF_NAME: ${{ github.head_ref || github.ref_name }}
+        GH_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        GH_WORKSPACE: ${{ github.workspace }}
+        # ACTIONS_ID_TOKEN_REQUEST_URL / _TOKEN are deliberately NOT declared here.
+        #
+        # The runner injects them into the job's process environment, which is where the scanner
+        # reads them from (os.Getenv). Re-declaring them from the `env` context — which reflects
+        # `env:` keys, not runner-injected variables — assigns the empty string when the context
+        # does not carry them, OVERWRITING the real inherited values for this step. Best case a
+        # no-op, worst case every upload dies with "no OIDC token available". Neither house action
+        # declares them.
+      run: |
+        set -uo pipefail
+
+        # ── Booleans, validated ──
+        #
+        # These were exact compares against lowercase `true` with no else-branch, so `dry-run: 'True'`
+        # -- a plausible YAML typo -- fell through to the REPORTING path and performed a real upload
+        # while the author believed nothing was sent. Anything not clearly true or false is refused
+        # rather than guessed.
+        norm_bool() {
+          case "$(printf '%s' "$2" | tr 'A-Z' 'a-z')" in
+            true|yes|1|on)   printf 'true'  ;;
+            false|no|0|off|"") printf 'false' ;;
+            *) echo "::error::visiblaze-secret: ${1} must be true or false, got '${2}'" >&2
+               printf 'invalid' ;;
+          esac
+        }
+        DRY_RUN="$(norm_bool dry-run "${IN_DRY_RUN}")"
+        FAIL_CLOSED="$(norm_bool fail-on-error "${IN_FAIL_ON_ERROR}")"
+        if [ "$DRY_RUN" = "invalid" ] || [ "$FAIL_CLOSED" = "invalid" ]; then
+          echo "status=failed" >> "$GITHUB_OUTPUT"
+          exit 1
+        fi
+
+        # Every failure path lands here. Default is to WARN and exit 0: a credential scanner that
+        # breaks a customer's pipeline because our endpoint is down has made their day worse and
+        # their repository no safer. fail-on-error: true opts into the stricter reading.
+        bail() {
+          local level="$1"; shift
+          echo "::${level}::visiblaze-secret: $*"
+          echo "status=failed" >> "$GITHUB_OUTPUT"
+          if [ "${FAIL_CLOSED}" = "true" ]; then exit 1; fi
+          exit 0
+        }
+
+        # fatal() is for INTEGRITY failures, and it ignores fail-on-error.
+        #
+        # The README promised "a re-tagged release or a replaced artefact changes the digest and the
+        # job stops". It did not: a checksum mismatch went through bail(), which on the documented
+        # default (fail-on-error: false) prints an annotation and exits 0 — so a substituted binary
+        # produced a green check. The binary was indeed not executed, but "the job stops" was false.
+        #
+        # The distinction is availability vs integrity. Our endpoint being down is our problem and
+        # must not break your build. A tampered artefact, an unverifiable pin, an api-url we do not
+        # permit, or a scan path outside your checkout are all cases where continuing quietly is
+        # worse than failing — and none of them are transient.
+        fatal() {
+          echo "::error::visiblaze-secret: $*"
+          echo "status=failed" >> "$GITHUB_OUTPUT"
+          exit 1
+        }
+
+        verify_sha256() {
+          local file="$1" expected="$2" actual=""
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual="$(sha256sum "$file" | awk '{print $1}')"
+          elif command -v shasum >/dev/null 2>&1; then
+            actual="$(shasum -a 256 "$file" | awk '{print $1}')"
+          else
+            fatal "no sha256sum or shasum on this runner — cannot verify a download, so nothing will be executed"
+          fi
+          # Lowercased both sides: a digest pasted from a release page is often uppercase, and a
+          # case mismatch must not read as tampering.
+          if [ "$(printf '%s' "$actual" | tr 'A-Z' 'a-z')" != "$(printf '%s' "$expected" | tr 'A-Z' 'a-z')" ]; then
+            fatal "checksum mismatch for $(basename "$file") — expected ${expected}, got ${actual}. Nothing was executed. Either the pin is stale or the artefact changed; do not 'fix' this by updating the digest without finding out which."
+          fi
+        }
+
+        # ── Pins ────────────────────────────────────────────────────────────────────────
+        PINS="${ACTION_PATH}/pins.env"
+        [ -f "$PINS" ] || fatal "pins.env is missing from the action — refusing to download anything unpinned"
+        set -a
+        # shellcheck disable=SC1090
+        . "$PINS"
+        set +a
+
+        # Fails closed on an unpopulated pin. The sentinel is the committed default, so an action
+        # published before its pins were filled cannot run rather than running unverified.
+        for required in SCANNER_VERSION SCANNER_BASE_URL; do
+          val="$(eval "printf '%s' \"\${${required}:-}\"")"
+          case "$val" in
+            ''|UNSET) fatal "${required} is unset in pins.env — this action will not run without a pinned release" ;;
+          esac
+        done
+
+        case "$(uname -m)" in
+          x86_64|amd64) ARCH=amd64 ;;
+          aarch64|arm64) ARCH=arm64 ;;
+          *) bail error "unsupported runner architecture $(uname -m); Visiblaze publishes linux/amd64 and linux/arm64" ;;
+        esac
+        if [ "$(uname -s)" != "Linux" ]; then
+          bail error "unsupported runner OS $(uname -s); Visiblaze publishes Linux builds only"
+        fi
+
+        case "$ARCH" in
+          amd64) EXPECTED="${SCANNER_SHA256_LINUX_AMD64:-}" ;;
+          arm64) EXPECTED="${SCANNER_SHA256_LINUX_ARM64:-}" ;;
+        esac
+        # Refused rather than falling back to the release's checksums.txt. A missing pin is the one
+        # condition under which a fallback would silently restore exactly the weakness this
+        # replaced, on a run that otherwise looks identical.
+        case "${EXPECTED}" in
+          ''|UNSET) fatal "pins.env carries no scanner digest for ${ARCH} — refusing to run a scanner this action commit does not pin" ;;
+        esac
+
+        # ── The API origin ──────────────────────────────────────────────────────────────
+        #
+        # Checked here, in readable shell, rather than inside the binary: the guarantee that
+        # findings can only reach a Visiblaze endpoint is one a reviewer can verify by reading this
+        # file instead of taking a compiled artefact on trust.
+        case "$IN_API" in
+          https://*) ;;
+          *) fatal "api-url must be https, got '${IN_API}'" ;;
+        esac
+        API_ORIGIN="$(printf '%s' "$IN_API" | awk -F/ '{print $1"//"$3}')"
+        API_OK=""
+        for ORIGIN in ${ALLOWED_API_ORIGINS:-}; do
+          if [ "$API_ORIGIN" = "$ORIGIN" ]; then API_OK="yes"; break; fi
+        done
+        # No allowlist at all is refused rather than treated as "anything goes". An empty variable
+        # is what a truncated or mis-sourced pins.env looks like, and defaulting it open would turn
+        # a broken file into a silent removal of this check.
+        [ -n "$API_OK" ] || fatal "api-url origin ${API_ORIGIN} is not one this action permits — findings may only be sent to a Visiblaze endpoint listed in pins.env"
+
+        # ── The scan path must stay inside the checkout ─────────────────────────────────
+        #
+        # Otherwise `path: ../..` would walk the runner's filesystem — including other jobs'
+        # checkouts and the runner's own credentials — and report what it found there as this
+        # repository's leaked secrets.
+        TARGET="$(cd "${GH_WORKSPACE}" 2>/dev/null && cd "${IN_PATH}" 2>/dev/null && pwd -P)" || \
+          fatal "path '${IN_PATH}' does not exist inside the checkout"
+        WSREAL="$(cd "${GH_WORKSPACE}" && pwd -P)"
+        case "$TARGET" in
+          "$WSREAL"|"$WSREAL"/*) ;;
+          *) fatal "path '${IN_PATH}' resolves outside the checkout (${TARGET}); refusing to scan it" ;;
+        esac
+
+        WORK="$(mktemp -d)"
+        trap 'rm -rf "$WORK"' EXIT
+
+        SCANNER_TGZ="visiblaze-secret-scan_${SCANNER_VERSION}_linux_${ARCH}.tar.gz"
+        BASE="${SCANNER_BASE_URL%/}/${SCANNER_VERSION}"
+        echo "visiblaze-secret: fetching scanner ${SCANNER_VERSION} (${ARCH})"
+        if ! curl -fsSL --retry 3 --retry-connrefused -o "${WORK}/${SCANNER_TGZ}" "${BASE}/${SCANNER_TGZ}"; then
+          bail error "could not download ${SCANNER_TGZ} from ${BASE}"
+        fi
+        verify_sha256 "${WORK}/${SCANNER_TGZ}" "$EXPECTED"
+
+        if ! tar -xzf "${WORK}/${SCANNER_TGZ}" -C "${WORK}"; then
+          bail error "could not extract ${SCANNER_TGZ}"
+        fi
+        [ -f "${WORK}/visiblaze-secret-scan" ] || fatal "${SCANNER_TGZ} did not contain visiblaze-secret-scan"
+        chmod +x "${WORK}/visiblaze-secret-scan"
+
+        # ── Arguments ───────────────────────────────────────────────────────────────────
+        REPO_KEY="${IN_REPO_KEY}"
+        [ -n "$REPO_KEY" ] || REPO_KEY="github#${GH_REPO_ID}"
+
+        ARGS=(
+          -dir "$TARGET"
+          -repo-key "$REPO_KEY"
+          -ref "$GH_REF_NAME"
+          -commit "$GH_SHA"
+          -tenant "$IN_TENANT"
+          -producer runner
+        )
+        [ -n "${IN_SCOPE}" ] && ARGS+=(-scope "${IN_SCOPE}")
+        [ -n "${IN_FAIL_ON}" ] && ARGS+=(-fail-on "${IN_FAIL_ON}")
+        # A real output contract, not a declared one.
+        #
+        # `outputs.findings` was wired to steps.scan.outputs.findings and nothing ever wrote it, so
+        # it was permanently the empty string — and `if: steps.x.outputs.findings != '0'` reads an
+        # empty string as "not zero", i.e. a gate that fires always. The scanner writes the counts
+        # to a file precisely so this wrapper does not have to scrape its log.
+        SUMMARY="${WORK}/summary.env"
+        ARGS+=(-summary-file "$SUMMARY")
+        ARGS+=(-api "$IN_API")
+        if [ "${DRY_RUN}" = "true" ]; then
+          ARGS+=(-dry-run)
+        fi
+
+        # The scanner mints its own GitHub OIDC token, for an audience bound to the credential
+        # ingest route. Nothing is stored in your repository secrets, so there is nothing to
+        # rotate and nothing to leak. The job must grant `id-token: write`.
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && [ "${DRY_RUN}" != "true" ]; then
+          bail error "no OIDC token available — add 'permissions: { id-token: write }' to this job"
+        fi
+
+        set +e
+        "${WORK}/visiblaze-secret-scan" "${ARGS[@]}"
+        rc=$?
+        set -e
+
+        # Published whatever the exit code, including a policy failure and a failed upload: a
+        # consumer that only learns the counts on success cannot report on the runs that matter.
+        if [ -f "$SUMMARY" ]; then
+          cat "$SUMMARY" >> "$GITHUB_OUTPUT"
+        else
+          # Explicitly zero-ish rather than absent, so a consumer never reads an empty string as a
+          # number. status= tells them whether to trust it.
+          printf 'findings=\nactionable=\n' >> "$GITHUB_OUTPUT"
+        fi
+
+        # Exit 2 is the scanner's policy verdict: credentials were found at or above --fail-on.
+        # That is YOUR result and it is reported as-is, regardless of fail-on-error, which governs
+        # only whether OUR failures break your build.
+        if [ "$rc" -eq 2 ]; then
+          echo "status=complete" >> "$GITHUB_OUTPUT"
+          echo "::error::visiblaze-secret: credentials found at or above ${IN_FAIL_ON}. Rotate them at the issuer, then purge them from history — deleting the line does not revoke the key."
+          exit 2
+        fi
+        if [ "$rc" -ne 0 ]; then
+          bail error "the scan did not complete (exit ${rc})"
+        fi
+        echo "status=complete" >> "$GITHUB_OUTPUT"
