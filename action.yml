@@ -93,6 +93,12 @@ runs:
         GH_REF_NAME: ${{ github.head_ref || github.ref_name }}
         GH_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         GH_WORKSPACE: ${{ github.workspace }}
+        GH_EVENT: ${{ github.event_name }}
+        # The three the baseline needs. All empty on any event that is not a pull request, which is
+        # what gates the whole block below.
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         # ACTIONS_ID_TOKEN_REQUEST_URL / _TOKEN are deliberately NOT declared here.
         #
         # The runner injects them into the job's process environment, which is where the scanner
@@ -278,6 +284,109 @@ runs:
         SUMMARY="${WORK}/summary.env"
         ARGS+=(-summary-file "$SUMMARY")
         ARGS+=(-api "$IN_API")
+        [ -n "${GH_EVENT:-}" ] && ARGS+=(-event "${GH_EVENT:-}")
+
+        # ── The merge base, on a pull request ────────────────────────────────────────────
+        #
+        # Without it the platform has nothing to compare against and reports "no baseline,
+        # nothing was compared" for every pull request — and every credential the branch
+        # ALREADY had reads as one this change introduced.
+        #
+        # Every failure below is NON-FATAL and lands in the same place: no baseline, so nothing is
+        # called new. A repository we cannot build a baseline for must not have its builds fail
+        # over our inability to build one.
+        #
+        # Feature-detected, because action.yml and pins.env move independently and the scanner
+        # rejects an unknown flag outright. An action newer than its pin would otherwise fail every
+        # pull request with "flag provided but not defined".
+        # Captured, then matched. NOT piped into `grep -q`.
+        #
+        # `grep -q` exits at the first match, the binary keeps writing usage lines, and it takes
+        # SIGPIPE — which `set -o pipefail` at the top of this script turns into a failed pipeline
+        # even though grep DID match. The baseline is then silently never requested, and the check
+        # reports "nothing was compared" on a run that should have had a baseline.
+        #
+        # Measured before the fix: 164 detections out of 200 identical invocations. Roughly one
+        # pull request in six, non-deterministically, with no error anywhere — found because it
+        # made a test flaky rather than because anything failed.
+        SUPPORTS_BASELINE=""
+        HELP_OUT="$("${WORK}/visiblaze-secret-scan" -h 2>&1 || true)"
+        case "$HELP_OUT" in
+          *-base-dir*) SUPPORTS_BASELINE="yes" ;;
+        esac
+
+        if [ -n "${BASE_SHA:-}" ] && [ "${DRY_RUN}" != "true" ] && [ -n "${SUPPORTS_BASELINE}" ]; then
+          BASE_WORKTREE="${WORK}/base"
+          if git -C "${GH_WORKSPACE}" rev-parse --git-dir >/dev/null 2>&1; then
+            # A pull-request checkout is shallow — actions/checkout defaults to fetch-depth 1 — and
+            # a merge base cannot be computed from one commit on each side. Deepened here rather
+            # than by asking you to change your checkout: a scanner that needs fetch-depth 0 to work
+            # is one that silently does less for everyone who did not read that far.
+            #
+            # Each error is CAPTURED, not discarded, so the message below can say which of four
+            # causes it was.
+            GITERR=""
+            if ! git -C "${GH_WORKSPACE}" fetch --no-tags --quiet --depth=200 \
+                   origin "+${BASE_SHA:-}:refs/visiblaze/secretbase" 2>"${WORK}/git.err"; then
+              GITERR="$(tr -d '\r' < "${WORK}/git.err" | tail -1)"
+              # A server that will not serve an arbitrary SHA still serves the branch it is on.
+              if git -C "${GH_WORKSPACE}" fetch --no-tags --quiet --depth=200 \
+                     origin "${BASE_REF:-}" 2>"${WORK}/git.err"; then
+                GITERR=""
+              else
+                GITERR="$(tr -d '\r' < "${WORK}/git.err" | tail -1)"
+              fi
+            fi
+            # Deepen the HEAD side too, or the two histories still never meet.
+            git -C "${GH_WORKSPACE}" fetch --no-tags --quiet --deepen=200 2>/dev/null || true
+
+            # Merge-base the PULL REQUEST'S HEAD against the base tip, never the checked-out HEAD.
+            #
+            # On a pull_request event the workspace is at refs/pull/N/merge, and the base tip is
+            # that merge commit's FIRST PARENT — so `merge-base HEAD "${BASE_SHA}"` returns
+            # BASE_SHA itself. Not an error, just the wrong commit: the base branch TIP rather than
+            # the fork point. That attributes to this pull request every credential that landed on
+            # the base branch since it was cut, and stores the baseline under a sha the platform
+            # never reads — it looks the base side up at GitHub's own merge base of
+            # (base tip, pull request head).
+            #
+            # HEAD^2 is the pull request's head on a merge-ref checkout and needs no fetch, so it is
+            # the fallback when the event payload is absent.
+            MB_HEAD="${PR_HEAD_SHA:-}"
+            [ -z "${MB_HEAD}" ] && MB_HEAD="$(git -C "${GH_WORKSPACE}" rev-parse --verify --quiet 'HEAD^2' 2>/dev/null || true)"
+            [ -z "${MB_HEAD}" ] && MB_HEAD="HEAD"
+            MERGE_BASE="$(git -C "${GH_WORKSPACE}" merge-base "${MB_HEAD}" "${BASE_SHA:-}" 2>"${WORK}/git.err" || true)"
+            if [ -z "${MERGE_BASE}" ]; then
+              # Weaker than a true merge base — it can call a credential new that was removed from
+              # the base since this branch was cut — so it is a fallback, only reached when the
+              # histories genuinely will not meet.
+              MERGE_BASE="$(git -C "${GH_WORKSPACE}" rev-parse --verify --quiet 'HEAD^1' 2>/dev/null || true)"
+              [ -n "${MERGE_BASE}" ] && echo "visiblaze-secret: no common history with the base; comparing against the merge commit's base parent instead"
+            fi
+            [ -z "${MERGE_BASE}" ] && [ -z "${GITERR}" ] && GITERR="$(tr -d '\r' < "${WORK}/git.err" | tail -1)"
+
+            if [ -n "${MERGE_BASE}" ] \
+               && git -C "${GH_WORKSPACE}" worktree add --detach --quiet "${BASE_WORKTREE}" "${MERGE_BASE}" 2>/dev/null; then
+              # The baseline must be the SAME SUBTREE, or a monorepo job comparing its package
+              # against the whole repository would call every credential outside its package "new".
+              BASE_SCAN_DIR="${BASE_WORKTREE}${TARGET#${WSREAL}}"
+              if [ -d "${BASE_SCAN_DIR}" ]; then
+                echo "visiblaze-secret: comparing against merge base ${MERGE_BASE}"
+                ARGS+=(-base-dir "${BASE_SCAN_DIR}" -base-sha "${MERGE_BASE}")
+                [ -n "${BASE_REF:-}" ] && ARGS+=(-base-ref "${BASE_REF:-}")
+              else
+                # The path did not exist on the base — a newly added subtree. Everything in it is
+                # genuinely new, but saying so from an empty baseline is a guess dressed as a
+                # measurement.
+                echo "visiblaze-secret: '${IN_PATH}' does not exist at the merge base, so this is a new subtree; nothing will be called inherited"
+              fi
+            else
+              echo "visiblaze-secret: could not resolve a merge base, so no credential can be shown to be new${GITERR:+ (git: ${GITERR})}"
+            fi
+          else
+            echo "visiblaze-secret: no git history available, so no credential can be shown to be new"
+          fi
+        fi
         if [ "${DRY_RUN}" = "true" ]; then
           ARGS+=(-dry-run)
         fi

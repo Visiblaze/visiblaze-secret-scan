@@ -14,11 +14,28 @@ APIs, which are provided under a separate commercial agreement.
 THIRD-PARTY SOFTWARE
 --------------------
 
-None.
+Nothing is downloaded from a third party at run time.
 
 This action downloads and executes exactly one binary, ours, verified against a
-digest pinned in pins.env before it runs. It bundles nothing, and it fetches
-nothing from any third party at run time.
+digest pinned in pins.env before it runs. It fetches nothing else, from anyone.
+That is a deliberate difference from the Visiblaze SAST action, which downloads
+Opengrep and therefore also downloads cosign to verify Opengrep's signature.
+
+The scanner does, however, EMBED a rule pack that includes detection rules
+derived from Trivy:
+
+Trivy - https://github.com/aquasecurity/trivy
+    Copyright Aqua Security Software Ltd.
+    Licensed under the Apache License, Version 2.0.
+
+    Visiblaze's secret rule pack carries detection patterns adapted from Trivy's
+    built-in secret rules (pkg/fanal/secret/builtin-rules.go, v0.70.0). Rule
+    identifiers are kept identical to Trivy's on purpose, so that a repository
+    scanned by both engines reports one finding rather than two. No Trivy code is
+    linked, bundled or executed by this action.
+
+    A copy of the Apache License, Version 2.0 is in LICENSE, which is the same
+    licence this repository is under.
 
 That is a deliberate difference from the Visiblaze SAST action, which downloads
 Opengrep and therefore also downloads cosign to verify Opengrep's signature.
