@@ -223,6 +223,9 @@ runs:
         esac
         API_ORIGIN="$(printf '%s' "$IN_API" | awk -F/ '{print $1"//"$3}')"
         API_OK=""
+        # Distinguished from "your origin is not listed" because the fix is different, and because
+        # an unquoted multi-origin pins.env produces exactly this state (see pins.env).
+        [ -n "${ALLOWED_API_ORIGINS:-}" ] || fatal "pins.env set no allowed origins — the file is truncated, mis-sourced, or has an unquoted multi-value ALLOWED_API_ORIGINS. Refusing to send anything."
         for ORIGIN in ${ALLOWED_API_ORIGINS:-}; do
           if [ "$API_ORIGIN" = "$ORIGIN" ]; then API_OK="yes"; break; fi
         done
