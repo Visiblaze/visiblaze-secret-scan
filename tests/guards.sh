@@ -163,6 +163,20 @@ if run "a dry run requests no baseline" 0 "verified-stub-ran" \
   grep -q "merge base" "$LAST_GHO" 2>/dev/null && { echo "  FAIL  a dry run resolved a merge base"; FAIL=$((FAIL+1)); }
 fi
 
+# The declared outputs must all be WRITTEN when the scanner leaves no summary behind, not merely
+# declared. `outputs.findings` was once wired to a value nothing ever wrote, so it was permanently
+# the empty string — and `if: steps.x.outputs.findings != '0'` reads an empty string as "not zero",
+# a gate that fires always. `classified` is the same trap with worse consequences: empty is falsey
+# in some readings and truthy in others, and the two answers are "this change introduced nothing"
+# and "we could not tell", which must never render the same. So it is written as an explicit false.
+if run "every declared output is written even with no summary file" 0 "verified-stub-ran" \
+    IN_DRY_RUN=true; then
+  for k in findings actionable ignored new existing classified; do
+    grep -q "^${k}=" "$LAST_GHO" 2>/dev/null || { echo "  FAIL  output ${k} was never written"; FAIL=$((FAIL+1)); }
+  done
+  grep -q "^classified=false$" "$LAST_GHO" 2>/dev/null || { echo "  FAIL  classified must be an explicit false, never empty"; FAIL=$((FAIL+1)); }
+fi
+
 echo "== the merge base is resolved from the PR HEAD, not the checked-out HEAD =="
 # THE subtle one, and the only guard here that needs real git history.
 #
