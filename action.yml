@@ -48,6 +48,17 @@ inputs:
     description: Fail the step when a finding is at or above this severity (critical|high|medium|low). Empty never fails on findings.
     required: false
     default: ''
+  fail-on-new:
+    description: >-
+      Fail the step only for credentials this change INTRODUCED, at or above this severity
+      (critical|high|medium|low). Prefer this over fail-on: a flat bar counts every credential the
+      branch already had, so on a repository with any inherited finding it means "always fail" and
+      blocks authors for something they did not commit. Needs a merge base, which this action
+      supplies on a pull request. With no trustworthy baseline nothing can be called new, so the
+      gate reports that it could not run rather than passing or failing silently — read
+      blocking-skipped-reason.
+    required: false
+    default: ''
   fail-on-error:
     description: Fail the step if the scan itself could not run. Default false, so an outage on our side does not break your build.
     required: false
@@ -73,6 +84,31 @@ outputs:
   lines-truncated:
     description: Lines too long to scan whole. Non-zero means part of the repository was not examined.
     value: ${{ steps.scan.outputs.lines_truncated }}
+  ignored:
+    description: >-
+      Findings the repository excepted in .visiblaze/secrets-ignore.yml. They are still reported and
+      still counted here — an exception nobody can see is indistinguishable from a miss — and they
+      do not fail the build.
+    value: ${{ steps.scan.outputs.ignored }}
+  new:
+    description: >-
+      Credentials this change introduced, measured against the merge base. Meaningless unless
+      `classified` is true.
+    value: ${{ steps.scan.outputs.new }}
+  existing:
+    description: Credentials the branch already had. These never fail a build under fail-on-new.
+    value: ${{ steps.scan.outputs.existing }}
+  classified:
+    description: >-
+      Whether new-versus-existing could be worked out at all. READ THIS BEFORE `new`: false with
+      new=0 means "we could not tell", which must never be rendered the same as "this change
+      introduced nothing".
+    value: ${{ steps.scan.outputs.classified }}
+  blocking-skipped-reason:
+    description: >-
+      Set when fail-on-new was configured and could not be applied. Empty otherwise. A configured
+      gate that did not run is a third outcome, not a pass.
+    value: ${{ steps.scan.outputs.blocking_skipped_reason }}
 
 runs:
   using: composite
@@ -86,6 +122,7 @@ runs:
         IN_PATH: ${{ inputs.path }}
         IN_SCOPE: ${{ inputs.scope }}
         IN_FAIL_ON: ${{ inputs.fail-on }}
+        IN_FAIL_ON_NEW: ${{ inputs.fail-on-new }}
         IN_FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
         IN_DRY_RUN: ${{ inputs.dry-run }}
         ACTION_PATH: ${{ github.action_path }}
@@ -278,6 +315,7 @@ runs:
         )
         [ -n "${IN_SCOPE}" ] && ARGS+=(-scope "${IN_SCOPE}")
         [ -n "${IN_FAIL_ON}" ] && ARGS+=(-fail-on "${IN_FAIL_ON}")
+        [ -n "${IN_FAIL_ON_NEW:-}" ] && ARGS+=(-fail-on-new "${IN_FAIL_ON_NEW:-}")
         # A real output contract, not a declared one.
         #
         # `outputs.findings` was wired to steps.scan.outputs.findings and nothing ever wrote it, so
@@ -413,7 +451,11 @@ runs:
         else
           # Explicitly zero-ish rather than absent, so a consumer never reads an empty string as a
           # number. status= tells them whether to trust it.
-          printf 'findings=\nactionable=\n' >> "$GITHUB_OUTPUT"
+          # Every key a consumer may read, or `outputs.classified` is the empty string and
+          # `if: steps.scan.outputs.classified != 'true'` silently reads as "not classified" for a
+          # run that simply had no summary — the same empty-string-is-truthy trap the comment above
+          # this block was written about.
+          printf 'findings=\nactionable=\nignored=\nnew=\nexisting=\nclassified=false\n' >> "$GITHUB_OUTPUT"
         fi
 
         # Exit 2 is the scanner's policy verdict: credentials were found at or above --fail-on.
@@ -421,7 +463,7 @@ runs:
         # only whether OUR failures break your build.
         if [ "$rc" -eq 2 ]; then
           echo "status=complete" >> "$GITHUB_OUTPUT"
-          echo "::error::visiblaze-secret: credentials found at or above ${IN_FAIL_ON}. Rotate them at the issuer, then purge them from history — deleting the line does not revoke the key."
+          echo "::error::visiblaze-secret: credentials found at or above ${IN_FAIL_ON:-${IN_FAIL_ON_NEW:-}}. Rotate them at the issuer, then purge them from history — deleting the line does not revoke the key."
           exit 2
         fi
         if [ "$rc" -ne 0 ]; then
