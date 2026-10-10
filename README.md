@@ -71,6 +71,43 @@ nothing.
 | `fail-on-error` | `false` | Whether **our** failure fails **your** build. See below. |
 | `dry-run` | `false` | Scan, print the envelope, upload nothing. |
 
+Boolean inputs accept `true`/`false`, `yes`/`no`, `1`/`0`, `on`/`off`, in any case. Anything else
+is refused and the step fails, rather than being guessed at.
+
+## Outputs
+
+| Output | Values | Notes |
+|---|---|---|
+| `status` | `complete` \| `failed` | Did the scan run. **Not comparable across Visiblaze actions** — see below |
+| `delivery-status` | `sent` \| `dry-run` \| `failed` | The same answer in the vocabulary every Visiblaze action uses |
+| `policy` | `pass` \| `fail` \| `not-applied` | The `fail-on` verdict. Empty if the run reached no verdict |
+| `findings` | count | Credential findings detected |
+| `actionable` | count | Findings not downgraded as test code. The number a policy acts on |
+| `files-read` | count | The coverage claim. A clean repository and an unscanned one both report zero findings |
+| `lines-truncated` | count | Non-zero means part of the repository was not examined |
+
+`policy` saves you parsing the exit code: `fail` is exactly the exit-2 case, `pass` means `fail-on`
+was set and not met, `not-applied` means no `fail-on` was given. It is **empty** when the scan
+never reached a verdict — read `status` first, because an empty string is not a pass.
+
+### One warning about `status`
+
+The three Visiblaze actions do not agree on how to spell it, and **they never will**, because
+workflows branch on today's values:
+
+| Action | `status` on a successful run |
+|---|---|
+| `visiblaze-sast-scan` | `sent` |
+| `visiblaze-sca-scan` | `sent` (or `partial`) |
+| `visiblaze-secret-scan` | `complete` |
+
+So `if: steps.x.outputs.status == 'sent'` is **silently false** for a secret scan that worked
+perfectly. Use **`delivery-status`** in anything that runs across more than one of them — every
+action answers it with `sent` | `dry-run` | `failed` (| `partial`). It also tells a dry run apart
+from a real upload, which `complete` cannot.
+
+`status` is not deprecated and is not going away. It is frozen.
+
 ## Two kinds of failure, kept separate
 
 - **`fail-on`** is your result. Credentials at or above the bar exit **2**, and that happens

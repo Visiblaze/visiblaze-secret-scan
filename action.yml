@@ -70,8 +70,40 @@ inputs:
 
 outputs:
   status:
-    description: complete | failed
+    description: >-
+      complete | failed
+
+      Frozen as-is, because workflows branch on it today. Note that `complete` is this action's
+      spelling alone: `visiblaze-sast` answers the same question with `sent` | `dry-run` |
+      `failed`. Use `delivery-status` for anything that must read the same on every Visiblaze
+      step. `complete` also does not distinguish a real upload from a dry run — `delivery-status`
+      does.
     value: ${{ steps.scan.outputs.status }}
+  delivery-status:
+    description: >-
+      The SAME question as `status` — did this run deliver its result — in the vocabulary every
+      Visiblaze action answers it in, so one `if:` expression works across all of them.
+
+      `sent` | `dry-run` | `failed`, plus `partial` from actions that can deliver part of a run
+      (this one cannot; it is listed so a consumer matching the full set does not have to be
+      rewritten when another step in the same workflow emits it).
+
+      Where `status` says `complete` this says `sent`, or `dry-run` when nothing was uploaded —
+      the distinction `status` cannot make.
+    value: ${{ steps.scan.outputs.delivery-status }}
+  policy:
+    description: >-
+      `pass` | `fail` | `not-applied` — the verdict of `fail-on`, in the same three values and
+      with the same meanings `visiblaze-sast` publishes.
+
+      `fail`: a finding at or above `fail-on` is present and the step exited 2. `pass`: `fail-on`
+      was set, was evaluated, and was not met. `not-applied`: no `fail-on` was given, so nothing
+      was gated on.
+
+      EMPTY when the scan did not produce a verdict at all — it could not run, or it failed before
+      the policy was evaluated. Read `status` first: an empty string is not a pass. This matches
+      `visiblaze-sast`, which also leaves `policy` unwritten on its failure paths.
+    value: ${{ steps.scan.outputs.policy }}
   findings:
     description: Number of credential findings detected. Empty if the scan did not run — check `status` before treating it as a number.
     value: ${{ steps.scan.outputs.findings }}
@@ -165,6 +197,7 @@ runs:
         FAIL_CLOSED="$(norm_bool fail-on-error "${IN_FAIL_ON_ERROR}")"
         if [ "$DRY_RUN" = "invalid" ] || [ "$FAIL_CLOSED" = "invalid" ]; then
           echo "status=failed" >> "$GITHUB_OUTPUT"
+          echo "delivery-status=failed" >> "$GITHUB_OUTPUT"
           exit 1
         fi
 
@@ -175,6 +208,7 @@ runs:
           local level="$1"; shift
           echo "::${level}::visiblaze-secret: $*"
           echo "status=failed" >> "$GITHUB_OUTPUT"
+          echo "delivery-status=failed" >> "$GITHUB_OUTPUT"
           if [ "${FAIL_CLOSED}" = "true" ]; then exit 1; fi
           exit 0
         }
@@ -193,6 +227,7 @@ runs:
         fatal() {
           echo "::error::visiblaze-secret: $*"
           echo "status=failed" >> "$GITHUB_OUTPUT"
+          echo "delivery-status=failed" >> "$GITHUB_OUTPUT"
           exit 1
         }
 
@@ -458,15 +493,50 @@ runs:
           printf 'findings=\nactionable=\nignored=\nnew=\nexisting=\nclassified=false\n' >> "$GITHUB_OUTPUT"
         fi
 
+        # DELIVERY is the `delivery-status` value for every path that got as far as running the
+        # scanner. `status` keeps saying `complete`, which is the value workflows branch on today
+        # and therefore cannot move; this is the same fact in the vocabulary visiblaze-sast uses,
+        # and it carries the dry-run/real distinction `complete` throws away.
+        #
+        # Honest about one limit: on exit 2 the scanner evaluates the policy even when the upload
+        # failed, so `sent` here means "a real (non-dry) run reached the upload", not "the platform
+        # acknowledged it". visiblaze-sast's `status` has always had the same imprecision on the
+        # same path, and matching it beats inventing a fourth reading — the wrapper cannot tell
+        # without scraping the scanner's log, which is the contract nobody declared.
+        if [ "${DRY_RUN}" = "true" ]; then DELIVERY="dry-run"; else DELIVERY="sent"; fi
+
         # Exit 2 is the scanner's policy verdict: credentials were found at or above --fail-on.
         # That is YOUR result and it is reported as-is, regardless of fail-on-error, which governs
         # only whether OUR failures break your build.
         if [ "$rc" -eq 2 ]; then
           echo "status=complete" >> "$GITHUB_OUTPUT"
+          echo "delivery-status=${DELIVERY}" >> "$GITHUB_OUTPUT"
+          # Mirrors visiblaze-sast, which publishes `policy=fail` from the scanner on its own exit-2
+          # path. Derived in the wrapper here rather than by the scanner because this scanner has
+          # only ONE policy — the caller's --fail-on — so exit 2 has exactly one cause and the
+          # wrapper can name it without guessing. visiblaze-sast has two (--fail-on and the tenant
+          # pull-request policy) and cannot, which is why it emits the value from inside the binary.
+          #
+          # `policy=fail` stays correct now that fail-on-new exists: both inputs are the same single
+          # policy expressed two ways, and exit 2 still has exactly one cause. The message below
+          # names whichever one was configured.
+          echo "policy=fail" >> "$GITHUB_OUTPUT"
           echo "::error::visiblaze-secret: credentials found at or above ${IN_FAIL_ON:-${IN_FAIL_ON_NEW:-}}. Rotate them at the issuer, then purge them from history — deleting the line does not revoke the key."
           exit 2
         fi
         if [ "$rc" -ne 0 ]; then
+          # No `policy` is written here, deliberately, and visiblaze-sast does the same: the scan
+          # did not reach a verdict, so there is no verdict to report. An absent output reads as an
+          # empty string, which is not `pass` — the description says to check `status` first.
           bail error "the scan did not complete (exit ${rc})"
         fi
         echo "status=complete" >> "$GITHUB_OUTPUT"
+        echo "delivery-status=${DELIVERY}" >> "$GITHUB_OUTPUT"
+        # rc 0 with a threshold set means the threshold was evaluated and not met. It cannot mean
+        # "the threshold was junk and was ignored": the scanner refuses an unrecognised -fail-on
+        # with exit 1, so `fail-on: severe` never reaches this line.
+        if [ -n "${IN_FAIL_ON}" ]; then
+          echo "policy=pass" >> "$GITHUB_OUTPUT"
+        else
+          echo "policy=not-applied" >> "$GITHUB_OUTPUT"
+        fi

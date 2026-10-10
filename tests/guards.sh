@@ -135,6 +135,84 @@ if run "verified archive is executed" 0 "verified-stub-ran"; then
   done
 fi
 
+echo "== the cross-action outputs: delivery-status and policy =="
+# WHY these are asserted on the real script rather than reasoned about: both are declared in the
+# `outputs:` block, and a declared output nothing ever writes is the exact defect `findings` had —
+# permanently the empty string, and `if: ... != '0'` reads empty as "not zero", so the gate fires
+# always. A declared-but-unwritten `policy` would be worse: empty is not `pass`, but a workflow
+# written as `policy != 'fail'` treats it as one.
+#
+# `status` is asserted alongside on every case. It is the frozen, customer-visible value and the
+# whole point of adding a second output was to leave it untouched; a test that only checks the new
+# name would not notice the old one moving.
+out_is() {  # out_is <key> <want> <label>
+  local got; got="$(grep "^${1}=" "$LAST_GHO" | tail -1 | cut -d= -f2-)"
+  if [ "$got" = "$2" ]; then printf '  ok    %s\n' "$3"; PASS=$((PASS+1))
+  else printf '  FAIL  %s\n        %s=%s (want %s)\n' "$3" "$1" "${got:-<unwritten>}" "$2"; FAIL=$((FAIL+1)); fi
+}
+
+if run "dry run: outputs published" 0 "verified-stub-ran" IN_DRY_RUN=true; then
+  out_is status         complete      "status stays 'complete' — the frozen value did not move"
+  out_is delivery-status dry-run      "delivery-status says dry-run, which 'complete' cannot express"
+  out_is policy         not-applied   "no fail-on given, so policy=not-applied"
+fi
+
+if run "fail-on set and not met: policy=pass" 0 "verified-stub-ran" IN_FAIL_ON=critical; then
+  out_is status         complete      "status unchanged by the fail-on verdict"
+  out_is policy         pass          "fail-on was evaluated and not met"
+fi
+
+# Exit 2 is the ONLY cause of a policy failure in this action (there is no tenant policy here), so
+# the wrapper can name it without asking the scanner — which is why `policy` is derived here and
+# not, as in visiblaze-sast, emitted from inside the binary.
+cat > "${BIN}/visiblaze-secret-scan" <<'STUB'
+#!/bin/sh
+case "$1" in
+  -h|--help) echo "  -base-dir string"; echo "  -base-sha string"; exit 0 ;;
+esac
+echo verified-stub-ran
+exit 2
+STUB
+chmod +x "${BIN}/visiblaze-secret-scan"
+tar -czf "${WORKROOT}/rel/v9.9.9/visiblaze-secret-scan_v9.9.9_linux_amd64.tar.gz" -C "$BIN" visiblaze-secret-scan
+GOOD="$(shasum -a 256 "${WORKROOT}/rel/v9.9.9/visiblaze-secret-scan_v9.9.9_linux_amd64.tar.gz" | awk '{print $1}')"
+pins "file://${WORKROOT}/rel" v9.9.9 "$GOOD"
+if run "a blocking finding exits 2 and says so in policy" 2 "credentials found at or above" \
+      IN_FAIL_ON=high IN_DRY_RUN=true; then
+  out_is status         complete      "status=complete on the blocking path too — the scan DID complete"
+  out_is policy         fail          "policy=fail, so a caller need not parse the exit code"
+  out_is delivery-status dry-run      "delivery-status still distinguishes the dry run"
+fi
+
+# A run that never reached a verdict must leave `policy` UNWRITTEN. Writing `not-applied` there
+# would claim no policy was configured, when the truth is that one was configured and never ran.
+pins "file://${WORKROOT}/rel" v9.9.9 deadbeef
+if run "a failed run writes no policy at all" 1 "checksum mismatch" IN_FAIL_ON=high; then
+  out_is status          failed  "status=failed"
+  out_is delivery-status failed  "delivery-status=failed"
+  if grep -q "^policy=" "$LAST_GHO"; then
+    echo "  FAIL  policy was written on a run that reached no verdict"; FAIL=$((FAIL+1))
+  else
+    echo "  ok    policy left unwritten — an empty string is not a pass, and status says why"; PASS=$((PASS+1))
+  fi
+fi
+
+# Restore the exit-0 stub and its pin. The cases above deliberately swapped both, and everything
+# below assumes the happy path — a suite whose later tests silently run against a broken fixture
+# is the failure mode this whole file exists to avoid.
+cat > "${BIN}/visiblaze-secret-scan" <<'STUB'
+#!/bin/sh
+case "$1" in
+  -h|--help) echo "  -base-dir string"; echo "  -base-sha string"; echo "  -repo-key string"; exit 0 ;;
+esac
+echo verified-stub-ran
+exit 0
+STUB
+chmod +x "${BIN}/visiblaze-secret-scan"
+tar -czf "${WORKROOT}/rel/v9.9.9/visiblaze-secret-scan_v9.9.9_linux_amd64.tar.gz" -C "$BIN" visiblaze-secret-scan
+GOOD="$(shasum -a 256 "${WORKROOT}/rel/v9.9.9/visiblaze-secret-scan_v9.9.9_linux_amd64.tar.gz" | awk '{print $1}')"
+pins "file://${WORKROOT}/rel" v9.9.9 "$GOOD"
+
 # 'True' must mean TRUE. Tested here and not earlier, because this is the only point where the two
 # readings diverge observably: a dry run executes the scanner, whereas a run treated as REAL stops
 # at the OIDC guard first ("no OIDC token available") since no token endpoint is present. Under the

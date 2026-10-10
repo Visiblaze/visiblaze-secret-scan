@@ -18,8 +18,6 @@ Nothing is downloaded from a third party at run time.
 
 This action downloads and executes exactly one binary, ours, verified against a
 digest pinned in pins.env before it runs. It fetches nothing else, from anyone.
-That is a deliberate difference from the Visiblaze SAST action, which downloads
-Opengrep and therefore also downloads cosign to verify Opengrep's signature.
 
 The scanner does, however, EMBED a rule pack that includes detection rules
 derived from Trivy:
