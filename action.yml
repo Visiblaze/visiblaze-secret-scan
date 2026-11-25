@@ -19,8 +19,8 @@
 #
 # ── What this costs you ──
 #
-# One binary download (~9 MB) and a pass over your text files. No third-party scanner, so no
-# second download and no signature chain to verify — see pins.env.
+# One scanner download (~9 MB), cosign to verify its signature, and a pass over your text files.
+# No third-party scanner — see pins.env.
 name: Visiblaze secret scan
 description: Detect credentials committed to this repository. Detection runs on your runner; only redacted findings are sent.
 author: Visiblaze
@@ -67,6 +67,13 @@ inputs:
     description: Scan and print what would be sent, upload nothing.
     required: false
     default: 'false'
+  sarif-output:
+    description: >-
+      Also write the findings as a SARIF 2.1.0 file at this path (relative to the workspace), for
+      github/codeql-action/upload-sarif or any other SARIF reader. It says where each credential is
+      and which rule matched; the credential itself is never written. Empty (the default) writes nothing.
+    required: false
+    default: ''
 
 outputs:
   status:
@@ -157,12 +164,17 @@ runs:
         IN_FAIL_ON_NEW: ${{ inputs.fail-on-new }}
         IN_FAIL_ON_ERROR: ${{ inputs.fail-on-error }}
         IN_DRY_RUN: ${{ inputs.dry-run }}
+        IN_SARIF_OUTPUT: ${{ inputs.sarif-output }}
         ACTION_PATH: ${{ github.action_path }}
         GH_REPO_ID: ${{ github.repository_id }}
         GH_REF_NAME: ${{ github.head_ref || github.ref_name }}
         GH_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         GH_WORKSPACE: ${{ github.workspace }}
         GH_EVENT: ${{ github.event_name }}
+        GH_REPOSITORY: ${{ github.repository }}
+        # The repository the pull request's head lives in. Different from GH_REPOSITORY only for a
+        # pull request from a fork, which is the one case GitHub refuses an OIDC token.
+        PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         # The three the baseline needs. All empty on any event that is not a pull request, which is
         # what gates the whole block below.
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -320,7 +332,20 @@ runs:
         esac
 
         WORK="$(mktemp -d)"
-        trap 'rm -rf "$WORK"' EXIT
+        # Composite actions have no post step, so the trap is the cleanup. On a self-hosted runner
+        # the checkout persists between jobs, and the merge-base worktree and the ref fetched for it
+        # would otherwise pile up there run after run.
+        cleanup() {
+          if [ -n "${BASE_WORKTREE:-}" ]; then
+            git -C "${GH_WORKSPACE}" worktree remove --force "${BASE_WORKTREE}" >/dev/null 2>&1 || true
+            git -C "${GH_WORKSPACE}" worktree prune >/dev/null 2>&1 || true
+          fi
+          if [ -n "${BASE_REF_FETCHED:-}" ]; then
+            git -C "${GH_WORKSPACE}" update-ref -d refs/visiblaze/secretbase >/dev/null 2>&1 || true
+          fi
+          rm -rf "$WORK"
+        }
+        trap cleanup EXIT
 
         SCANNER_TGZ="visiblaze-secret-scan_${SCANNER_VERSION}_linux_${ARCH}.tar.gz"
         BASE="${SCANNER_BASE_URL%/}/${SCANNER_VERSION}"
@@ -329,6 +354,46 @@ runs:
           bail error "could not download ${SCANNER_TGZ} from ${BASE}"
         fi
         verify_sha256 "${WORK}/${SCANNER_TGZ}" "$EXPECTED"
+
+        # ── Provenance, on top of the digest ────────────────────────────────────────────
+        #
+        # The digest says these are the bytes this action commit names. The Sigstore signature says
+        # OUR release workflow built them, so a digest recorded in error still cannot point at bytes
+        # we never released. Required once pins.env says the release is signed. Every failure of
+        # the check itself is fatal; only a download that will not download is a bail().
+        #
+        # NETWORK: keyless verification reads Sigstore's trust root. A runner behind a
+        # TLS-intercepting proxy may be refused; the answer is to let sigstore.dev through
+        # unintercepted, never to skip this.
+        if [ "${SCANNER_SIGNED:-false}" = "true" ]; then
+          case "$ARCH" in
+            amd64) COSIGN_URL="${COSIGN_URL_LINUX_AMD64:-}"; COSIGN_SHA="${COSIGN_SHA256_LINUX_AMD64:-}" ;;
+            arm64) COSIGN_URL="${COSIGN_URL_LINUX_ARM64:-}"; COSIGN_SHA="${COSIGN_SHA256_LINUX_ARM64:-}" ;;
+          esac
+          for pair in "COSIGN_URL=${COSIGN_URL}" "COSIGN_SHA256=${COSIGN_SHA}" \
+                      "SCANNER_CERT_IDENTITY_REGEXP=${SCANNER_CERT_IDENTITY_REGEXP:-}" \
+                      "SCANNER_CERT_OIDC_ISSUER=${SCANNER_CERT_OIDC_ISSUER:-}"; do
+            case "${pair#*=}" in
+              ''|UNSET) fatal "${pair%%=*} is not pinned in pins.env. Signature verification cannot be skipped by leaving it blank." ;;
+            esac
+          done
+          if ! curl -fsSL --retry 3 --retry-connrefused -o "${WORK}/cosign" "${COSIGN_URL}"; then
+            bail error "could not download cosign from ${COSIGN_URL} — the scanner's signature cannot be checked, so nothing will be executed"
+          fi
+          verify_sha256 "${WORK}/cosign" "${COSIGN_SHA}"
+          chmod +x "${WORK}/cosign"
+          if ! curl -fsSL --retry 3 --retry-connrefused -o "${WORK}/${SCANNER_TGZ}.sigstore.json" "${BASE}/${SCANNER_TGZ}.sigstore.json"; then
+            bail error "could not download the signature bundle for ${SCANNER_TGZ} — refusing to run an unverified scanner"
+          fi
+          if ! "${WORK}/cosign" verify-blob \
+                --bundle "${WORK}/${SCANNER_TGZ}.sigstore.json" \
+                --certificate-identity-regexp "${SCANNER_CERT_IDENTITY_REGEXP}" \
+                --certificate-oidc-issuer "${SCANNER_CERT_OIDC_ISSUER}" \
+                "${WORK}/${SCANNER_TGZ}" >/dev/null 2>&1; then
+            fatal "visiblaze-secret-scan signature verification FAILED: the digest matched but the archive was not signed by the Visiblaze release workflow (${SCANNER_CERT_IDENTITY_REGEXP}). Do not proceed by relaxing this check."
+          fi
+          echo "visiblaze-secret: scanner signature verified (Visiblaze release workflow)"
+        fi
 
         if ! tar -xzf "${WORK}/${SCANNER_TGZ}" -C "${WORK}"; then
           bail error "could not extract ${SCANNER_TGZ}"
@@ -402,6 +467,7 @@ runs:
             # Each error is CAPTURED, not discarded, so the message below can say which of four
             # causes it was.
             GITERR=""
+            BASE_REF_FETCHED="yes"
             if ! git -C "${GH_WORKSPACE}" fetch --no-tags --quiet --depth=200 \
                    origin "+${BASE_SHA:-}:refs/visiblaze/secretbase" 2>"${WORK}/git.err"; then
               GITERR="$(tr -d '\r' < "${WORK}/git.err" | tail -1)"
@@ -466,12 +532,49 @@ runs:
         if [ "${DRY_RUN}" = "true" ]; then
           ARGS+=(-dry-run)
         fi
+        # Feature-detected: a pinned scanner older than -sarif-out would reject the flag and fail the run.
+        if [ -n "${IN_SARIF_OUTPUT:-}" ]; then
+          case "${IN_SARIF_OUTPUT}" in
+            /*|*..*) fatal "sarif-output '${IN_SARIF_OUTPUT}' must be a relative path inside the workspace" ;;
+          esac
+          # The string check does not stop a symlink committed in the pull request: the directory is
+          # resolved and must stay in the checkout, and a symlink at the file's own name is refused
+          # here and again by the scanner, which never writes through one.
+          SARIF_PARENT="$(dirname "${GH_WORKSPACE}/${IN_SARIF_OUTPUT}")"
+          if [ -d "${SARIF_PARENT}" ]; then
+            SARIF_PARENT_REAL="$(cd "${SARIF_PARENT}" && pwd -P)"
+            case "${SARIF_PARENT_REAL}" in
+              "${WSREAL}"|"${WSREAL}"/*) ;;
+              *) fatal "sarif-output '${IN_SARIF_OUTPUT}' resolves to ${SARIF_PARENT_REAL}, outside the checkout — refusing to write there" ;;
+            esac
+          fi
+          if [ -L "${GH_WORKSPACE}/${IN_SARIF_OUTPUT}" ]; then
+            fatal "sarif-output '${IN_SARIF_OUTPUT}' is a symlink in the checkout — refusing to write through it"
+          fi
+          case "$HELP_OUT" in
+            *-sarif-out*) ARGS+=(-sarif-out "${GH_WORKSPACE}/${IN_SARIF_OUTPUT}") ;;
+            *) echo "::warning::visiblaze-secret: this scanner cannot write SARIF; re-pin to a newer scanner to use sarif-output" ;;
+          esac
+        fi
 
         # The scanner mints its own GitHub OIDC token, for an audience bound to the credential
         # ingest route. Nothing is stored in your repository secrets, so there is nothing to
         # rotate and nothing to leak. The job must grant `id-token: write`.
+        #
+        # No token at all is not always a mistake. GitHub gives a pull request from a FORK no OIDC
+        # token, whatever the workflow asks for, so for that event the scan still runs here and
+        # fail-on / fail-on-new are still enforced — the step can still go red on a committed key —
+        # and nothing is uploaded. Anywhere else a missing token is the missing permission, and it
+        # stays an error.
+        LOCAL_ONLY=""
         if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && [ "${DRY_RUN}" != "true" ]; then
-          bail error "no OIDC token available — add 'permissions: { id-token: write }' to this job"
+          if [ "${GH_EVENT:-}" = "pull_request" ] && [ -n "${PR_HEAD_REPO:-}" ] && [ "${PR_HEAD_REPO}" != "${GH_REPOSITORY:-}" ]; then
+            LOCAL_ONLY="yes"
+            echo "::warning::visiblaze-secret: this pull request comes from a fork (${PR_HEAD_REPO}), and GitHub issues no OIDC token to fork pull requests. Scanned on this runner and fail-on enforced; nothing was sent to Visiblaze."
+            ARGS+=(-dry-run)
+          else
+            bail error "no OIDC token available — add 'permissions: { id-token: write }' to this job"
+          fi
         fi
 
         set +e
@@ -504,24 +607,33 @@ runs:
         # same path, and matching it beats inventing a fourth reading — the wrapper cannot tell
         # without scraping the scanner's log, which is the contract nobody declared.
         if [ "${DRY_RUN}" = "true" ]; then DELIVERY="dry-run"; else DELIVERY="sent"; fi
+        # A fork pull request was scanned and gated here, and delivered nothing.
+        if [ -n "${LOCAL_ONLY}" ]; then DELIVERY="failed"; fi
 
-        # Exit 2 is the scanner's policy verdict: credentials were found at or above --fail-on.
-        # That is YOUR result and it is reported as-is, regardless of fail-on-error, which governs
-        # only whether OUR failures break your build.
+        # Exit 2 is the scanner's policy verdict. That is YOUR result and it is reported as-is,
+        # regardless of fail-on-error, which governs only whether OUR failures break your build.
         if [ "$rc" -eq 2 ]; then
           echo "status=complete" >> "$GITHUB_OUTPUT"
           echo "delivery-status=${DELIVERY}" >> "$GITHUB_OUTPUT"
-          # Mirrors visiblaze-sast, which publishes `policy=fail` from the scanner on its own exit-2
-          # path. Derived in the wrapper here rather than by the scanner because this scanner has
-          # only ONE policy — the caller's --fail-on — so exit 2 has exactly one cause and the
-          # wrapper can name it without guessing. visiblaze-sast has two (--fail-on and the tenant
-          # pull-request policy) and cannot, which is why it emits the value from inside the binary.
-          #
-          # `policy=fail` stays correct now that fail-on-new exists: both inputs are the same single
-          # policy expressed two ways, and exit 2 still has exactly one cause. The message below
-          # names whichever one was configured.
           echo "policy=fail" >> "$GITHUB_OUTPUT"
-          echo "::error::visiblaze-secret: credentials found at or above ${IN_FAIL_ON:-${IN_FAIL_ON_NEW:-}}. Rotate them at the issuer, then purge them from history — deleting the line does not revoke the key."
+          # Exit 2 has three possible deciders: this step's `fail-on`, its `fail-on-new`, and your
+          # organisation's pull-request policy, which the platform returns with the upload. The
+          # message names the ones that could have fired. With neither input set only the
+          # organisation's policy can have blocked; it was once reported as "at or above ." - an
+          # empty threshold, blamed on the wrong decider, in the one line GitHub shows on the pull
+          # request. The scanner's log above names the credentials and the rule that blocked.
+          DECIDERS=""
+          [ -n "${IN_FAIL_ON}" ] && DECIDERS="fail-on '${IN_FAIL_ON}'"
+          [ -n "${IN_FAIL_ON_NEW:-}" ] && DECIDERS="${DECIDERS:+${DECIDERS} or }fail-on-new '${IN_FAIL_ON_NEW}'"
+          ROTATE="Rotate them at the issuer, then purge them from history — deleting the line does not revoke the key."
+          if [ -z "${DECIDERS}" ]; then
+            echo "::error::visiblaze-secret: this change introduced credentials your organisation's pull-request policy blocks on — the run log names them and the rule that blocked. ${ROTATE}"
+          elif [ "${DRY_RUN}" = "true" ] || [ -n "${LOCAL_ONLY}" ]; then
+            # Nothing was uploaded, so no organisation policy came back: the inputs decided.
+            echo "::error::visiblaze-secret: credentials met ${DECIDERS}. ${ROTATE}"
+          else
+            echo "::error::visiblaze-secret: credentials met ${DECIDERS}, or your organisation's pull-request policy — the run log says which. ${ROTATE}"
+          fi
           exit 2
         fi
         if [ "$rc" -ne 0 ]; then
@@ -535,7 +647,21 @@ runs:
         # rc 0 with a threshold set means the threshold was evaluated and not met. It cannot mean
         # "the threshold was junk and was ignored": the scanner refuses an unrecognised -fail-on
         # with exit 1, so `fail-on: severe` never reaches this line.
+        #
+        # fail-on-new is the same policy measured against the merge base, and it counts as applied
+        # only when the scanner could classify new versus existing. When it could not, the gate did
+        # not run - that is `not-applied`, with blocking-skipped-reason saying why - never `pass`.
+        SKIPPED_WHY=""
+        CLASSIFIED=""
+        if [ -f "$SUMMARY" ]; then
+          # `|| true`: `set -e` is back in force here, and a key the summary does not carry is an
+          # answer (empty), not a reason to abort the step.
+          SKIPPED_WHY="$(grep '^blocking_skipped_reason=' "$SUMMARY" | tail -1 | cut -d= -f2- || true)"
+          CLASSIFIED="$(grep '^classified=' "$SUMMARY" | tail -1 | cut -d= -f2- || true)"
+        fi
         if [ -n "${IN_FAIL_ON}" ]; then
+          echo "policy=pass" >> "$GITHUB_OUTPUT"
+        elif [ -n "${IN_FAIL_ON_NEW:-}" ] && [ "${CLASSIFIED}" = "true" ] && [ -z "${SKIPPED_WHY}" ]; then
           echo "policy=pass" >> "$GITHUB_OUTPUT"
         else
           echo "policy=not-applied" >> "$GITHUB_OUTPUT"

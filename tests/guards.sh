@@ -177,7 +177,7 @@ chmod +x "${BIN}/visiblaze-secret-scan"
 tar -czf "${WORKROOT}/rel/v9.9.9/visiblaze-secret-scan_v9.9.9_linux_amd64.tar.gz" -C "$BIN" visiblaze-secret-scan
 GOOD="$(shasum -a 256 "${WORKROOT}/rel/v9.9.9/visiblaze-secret-scan_v9.9.9_linux_amd64.tar.gz" | awk '{print $1}')"
 pins "file://${WORKROOT}/rel" v9.9.9 "$GOOD"
-if run "a blocking finding exits 2 and says so in policy" 2 "credentials found at or above" \
+if run "a blocking finding exits 2 and says so in policy" 2 "credentials met fail-on 'high'" \
       IN_FAIL_ON=high IN_DRY_RUN=true; then
   out_is status         complete      "status=complete on the blocking path too — the scan DID complete"
   out_is policy         fail          "policy=fail, so a caller need not parse the exit code"
@@ -301,6 +301,114 @@ else
   printf '  FAIL  no merge base resolved at all\n        %s\n' "$(printf '%s' "$OUT" | grep -i 'merge base' | tail -1)"
   FAIL=$((FAIL+1))
 fi
+
+# The run above built a merge-base worktree and fetched a ref for it. On a self-hosted runner the
+# checkout persists, so both must be gone when the step ends, whatever path it ended on.
+if git -C "$GITWS" show-ref --verify --quiet refs/visiblaze/secretbase; then
+  echo "  FAIL  refs/visiblaze/secretbase left behind"; FAIL=$((FAIL+1))
+else
+  echo "  ok    no refs/visiblaze/secretbase left behind"; PASS=$((PASS+1))
+fi
+if [ "$(git -C "$GITWS" worktree list | wc -l | tr -d ' ')" = "1" ]; then
+  echo "  ok    the merge-base worktree was removed"; PASS=$((PASS+1))
+else
+  echo "  FAIL  worktrees left behind: $(git -C "$GITWS" worktree list | tail -n +2)"; FAIL=$((FAIL+1))
+fi
+
+echo "== the scanner signature (SCANNER_SIGNED=true) =="
+# cosign stand-in, served over file:// like everything else. It only says pass or fail: a real
+# Sigstore verification needs a real release, which tests/e2e is for.
+printf '#!/bin/sh\n[ -n "${COSIGN_FAIL:-}" ] && exit 1\necho "cosign-args: $*" >&2\nexit 0\n' > "${WORKROOT}/cosign"
+chmod +x "${WORKROOT}/cosign"
+COSIGN_GOOD="$(shasum -a 256 "${WORKROOT}/cosign" | awk '{print $1}')"
+echo '{}' > "${WORKROOT}/rel/v9.9.9/visiblaze-secret-scan_v9.9.9_linux_amd64.tar.gz.sigstore.json"
+signed_pins() {  # signed_pins <cosign digest>
+  pins "file://${WORKROOT}/rel" v9.9.9 "$GOOD"
+  { echo "SCANNER_SIGNED=true"
+    echo "SCANNER_CERT_IDENTITY_REGEXP='^https://example[.]invalid/wf[.]yml@refs/heads/(main|dev)\$'"
+    echo "SCANNER_CERT_OIDC_ISSUER=https://token.actions.githubusercontent.com"
+    echo "COSIGN_URL_LINUX_AMD64=file://${WORKROOT}/cosign"
+    echo "COSIGN_SHA256_LINUX_AMD64=${1}"
+    echo "COSIGN_URL_LINUX_ARM64=file://${WORKROOT}/cosign"
+    echo "COSIGN_SHA256_LINUX_ARM64=${1}"
+  } >> "${WORKROOT}/actdir/pins.env"
+}
+signed_pins "$COSIGN_GOOD"
+run "a verified signature lets the scanner run" 0 "scanner signature verified"
+run "a signature that does not verify is fatal, even with fail-on-error=false" 1 "signature verification FAILED" COSIGN_FAIL=1
+signed_pins 0000000000000000000000000000000000000000000000000000000000000000
+run "a tampered cosign is refused before it runs" 1 "checksum mismatch for cosign"
+signed_pins "$COSIGN_GOOD"
+grep -v '^SCANNER_CERT_IDENTITY_REGEXP=' "${WORKROOT}/actdir/pins.env" > "${WORKROOT}/p" && mv "${WORKROOT}/p" "${WORKROOT}/actdir/pins.env"
+run "a signed release with no pinned identity is refused" 1 "SCANNER_CERT_IDENTITY_REGEXP is not pinned"
+rm -f "${WORKROOT}/rel/v9.9.9/visiblaze-secret-scan_v9.9.9_linux_amd64.tar.gz.sigstore.json"
+signed_pins "$COSIGN_GOOD"
+run "a missing bundle is refused (availability, so a bail)" 0 "could not download the signature bundle"
+pins "file://${WORKROOT}/rel" v9.9.9 "$GOOD"
+
+echo "== a pull request from a fork: scanned and gated here, nothing uploaded =="
+cat > "${BIN}/visiblaze-secret-scan" <<'STUB'
+#!/bin/sh
+case "$1" in
+  -h|--help) echo "  -base-dir string"; echo "  -base-sha string"; echo "  -sarif-out string"; exit 0 ;;
+esac
+echo "scanner-args: $*"
+sum=""; prev=""
+for a in "$@"; do [ "$prev" = "-summary-file" ] && sum="$a"; prev="$a"; done
+[ -n "$sum" ] && [ -n "${STUB_SUMMARY:-}" ] && printf '%b' "$STUB_SUMMARY" > "$sum"
+exit "${STUB_RC:-0}"
+STUB
+chmod +x "${BIN}/visiblaze-secret-scan"
+tar -czf "${WORKROOT}/rel/v9.9.9/visiblaze-secret-scan_v9.9.9_linux_amd64.tar.gz" -C "$BIN" visiblaze-secret-scan
+GOOD="$(shasum -a 256 "${WORKROOT}/rel/v9.9.9/visiblaze-secret-scan_v9.9.9_linux_amd64.tar.gz" | awk '{print $1}')"
+pins "file://${WORKROOT}/rel" v9.9.9 "$GOOD"
+FORK_ENV=(IN_DRY_RUN=false GH_EVENT=pull_request GH_REPOSITORY=o/r PR_HEAD_REPO=someone/r ACTIONS_ID_TOKEN_REQUEST_URL=)
+if run "a fork PR without a token scans instead of bailing" 0 "comes from a fork" "${FORK_ENV[@]}"; then
+  out_is status          complete "fork PR: status=complete — the scan ran"
+  out_is delivery-status failed   "fork PR: delivery-status=failed — nothing was sent"
+fi
+run "the fork PR scan is local only (-dry-run passed)" 0 "scanner-args: .*-dry-run" "${FORK_ENV[@]}"
+run "a fork PR still enforces fail-on (exit 2)" 2 "credentials met fail-on 'high'\." "${FORK_ENV[@]}" IN_FAIL_ON=high STUB_RC=2
+run "fail-on-error does not turn a fork PR red" 0 "comes from a fork" "${FORK_ENV[@]}" IN_FAIL_ON_ERROR=true
+run "a same-repository PR without a token is still an error" 1 "no OIDC token available" \
+    IN_DRY_RUN=false IN_FAIL_ON_ERROR=true GH_EVENT=pull_request GH_REPOSITORY=o/r PR_HEAD_REPO=o/r ACTIONS_ID_TOKEN_REQUEST_URL=
+
+echo "== policy with fail-on-new =="
+if run "fail-on-new, classified and not met" 0 "scanner-args" IN_FAIL_ON_NEW=high \
+    STUB_SUMMARY='findings=1\nnew=0\nexisting=1\nclassified=true\n'; then
+  out_is policy pass "policy=pass when fail-on-new was evaluated and not met"
+fi
+if run "fail-on-new that could not classify" 0 "scanner-args" IN_FAIL_ON_NEW=high \
+    STUB_SUMMARY='findings=1\nnew=0\nexisting=0\nclassified=false\nblocking_skipped_reason=no merge base\n'; then
+  out_is policy not-applied "policy=not-applied when the gate could not run — never a pass"
+fi
+if run "fail-on-new met" 2 "credentials met fail-on-new 'high'" IN_FAIL_ON_NEW=high STUB_RC=2; then
+  out_is policy fail "policy=fail when fail-on-new blocked"
+fi
+
+echo "== exit 2 names who blocked =="
+# Neither input set: only the organisation's pull-request policy can have blocked. The message
+# must say so, never "at or above ." with an empty threshold.
+if run "org policy alone blocking names the policy" 2 "your organisation's pull-request policy blocks on" STUB_RC=2; then
+  out_is policy fail "policy=fail when the org policy blocked"
+fi
+run "org policy alone never prints an empty threshold" 2 "the rule that blocked" STUB_RC=2
+if printf '%s' "$(env PATH="${STUB}:$PATH" GITHUB_OUTPUT=/dev/null IN_TENANT=t IN_API="$API_OK" IN_REPO_KEY='github#1' IN_PATH=. IN_SCOPE= IN_FAIL_ON= IN_FAIL_ON_ERROR=false IN_DRY_RUN=true ACTION_PATH="${WORKROOT}/actdir" GH_REPO_ID=1 GH_REF_NAME=main GH_SHA=abc GH_WORKSPACE="${WORKROOT}/ws" STUB_RC=2 bash "$SCRIPT" 2>&1)" | grep -q 'at or above \.'; then
+  echo "  FAIL  an empty threshold was printed"; FAIL=$((FAIL+1))
+else
+  echo "  ok    no empty threshold in the message"; PASS=$((PASS+1))
+fi
+run "a real run with fail-on set allows for the org policy too" 2 "credentials met fail-on 'high', or your organisation's pull-request policy" \
+    IN_DRY_RUN=false IN_FAIL_ON=high STUB_RC=2 ACTIONS_ID_TOKEN_REQUEST_URL=https://tok.example/x
+run "both inputs are named" 2 "fail-on 'critical' or fail-on-new 'high'" IN_FAIL_ON=critical IN_FAIL_ON_NEW=high STUB_RC=2
+
+echo "== sarif-output never writes through a symlink =="
+ln -sfn "${WORKROOT}/outside" "${WORKROOT}/ws/reports"
+run "a directory symlink out of the checkout is refused" 1 "outside the checkout" IN_SARIF_OUTPUT=reports/s.sarif
+ln -sfn "${WORKROOT}/outside/victim" "${WORKROOT}/ws/s.sarif"
+run "a symlink at the file name is refused" 1 "is a symlink in the checkout" IN_SARIF_OUTPUT=s.sarif
+rm -f "${WORKROOT}/ws/reports" "${WORKROOT}/ws/s.sarif"
+run "a plain workspace path is passed to the scanner" 0 "scanner-args: .*-sarif-out ${WORKROOT}/ws/s.sarif" IN_SARIF_OUTPUT=s.sarif
 
 echo "== the platform gate itself =="
 out="$(env GITHUB_OUTPUT="${WORKROOT}/g2" IN_TENANT=t IN_API="$API_OK" IN_REPO_KEY='github#1' \

@@ -70,6 +70,7 @@ nothing.
 | `fail-on` | never | `critical`\|`high`\|`medium`\|`low`. Fails the step at or above this severity. |
 | `fail-on-error` | `false` | Whether **our** failure fails **your** build. See below. |
 | `dry-run` | `false` | Scan, print the envelope, upload nothing. |
+| `sarif-output` | *(empty)* | Also write a SARIF 2.1.0 file at this workspace-relative path, for GitHub code scanning. |
 
 Boolean inputs accept `true`/`false`, `yes`/`no`, `1`/`0`, `on`/`off`, in any case. Anything else
 is refused and the step fails, rather than being guessed at.
@@ -80,14 +81,16 @@ is refused and the step fails, rather than being guessed at.
 |---|---|---|
 | `status` | `complete` \| `failed` | Did the scan run. **Not comparable across Visiblaze actions** — see below |
 | `delivery-status` | `sent` \| `dry-run` \| `failed` | The same answer in the vocabulary every Visiblaze action uses |
-| `policy` | `pass` \| `fail` \| `not-applied` | The `fail-on` verdict. Empty if the run reached no verdict |
+| `policy` | `pass` \| `fail` \| `not-applied` | The `fail-on` / `fail-on-new` verdict. Empty if the run reached no verdict |
 | `findings` | count | Credential findings detected |
 | `actionable` | count | Findings not downgraded as test code. The number a policy acts on |
 | `files-read` | count | The coverage claim. A clean repository and an unscanned one both report zero findings |
 | `lines-truncated` | count | Non-zero means part of the repository was not examined |
 
 `policy` saves you parsing the exit code: `fail` is exactly the exit-2 case, `pass` means `fail-on`
-was set and not met, `not-applied` means no `fail-on` was given. It is **empty** when the scan
+or `fail-on-new` was set, evaluated and not met, `not-applied` means no threshold was given — or
+`fail-on-new` was given and could not be evaluated because there was no trustworthy merge base, in
+which case `blocking-skipped-reason` says why. A gate that could not run is never reported as a pass. It is **empty** when the scan
 never reached a verdict — read `status` first, because an empty string is not a pass.
 
 ### One warning about `status`
@@ -108,6 +111,31 @@ from a real upload, which `complete` cannot.
 
 `status` is not deprecated and is not going away. It is frozen.
 
+## Show findings in GitHub code scanning
+
+```yaml
+    permissions:
+      contents: read
+      id-token: write
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Visiblaze/visiblaze-secret-scan@<commit-sha>
+        with:
+          tenant: your-tenant-id
+          api-url: https://<your-visiblaze-ingest-endpoint>/v1/code/secrets
+          sarif-output: visiblaze-secrets.sarif
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: visiblaze-secrets.sarif
+          category: visiblaze-secrets
+```
+
+The file names the file, line and rule for each credential and **never the credential itself**,
+not even redacted. Use the `visiblaze-secrets` category so this upload does not replace the SAST
+one. Private repositories need GitHub Code Security enabled for code scanning to accept it.
+
 ## Two kinds of failure, kept separate
 
 - **`fail-on`** is your result. Credentials at or above the bar exit **2**, and that happens
@@ -123,21 +151,35 @@ One binary, ours, from a release pinned by **digest** in
 release or a replaced artefact changes the digest and the job **fails**, without executing
 anything.
 
+The archive is also **signature-checked**: it is built and signed in CI by the Visiblaze release
+workflow, and the action verifies its Sigstore signature against that workflow's pinned identity,
+using a cosign that is itself pinned by digest. A digest recorded in error still cannot point at
+bytes we never released. Verification reads Sigstore's trust root, so a self-hosted runner behind
+a TLS-intercepting proxy must let `sigstore.dev` through unintercepted; the check is never skipped.
+
 Note *fails*, not warns. Integrity failures ignore `fail-on-error` entirely: a tampered artefact,
 an unverifiable pin, an `api-url` we do not permit, or a scan path outside your checkout all exit
 non-zero however you configure the action. `fail-on-error` governs only **our** availability — a
 download timeout or an ingest outage — because that is our problem and should not break your
 build. A substituted binary is not our availability problem.
 
-There is no third-party scanner, so there is no second download and no signature chain to verify.
-Credential detection is regular expressions over text; implementing it ourselves means one artefact
-to trust instead of three.
+There is no third-party scanner. Credential detection is regular expressions over text;
+implementing it ourselves means one scanner to trust, plus the cosign that verifies it.
 
 ## Permissions
 
 `id-token: write` is required. The scanner mints a short-lived GitHub OIDC token whose audience is
 bound to the credential ingest route — so nothing is stored in your repository secrets, there is
 nothing to rotate, and a token minted here cannot be replayed against another Visiblaze endpoint.
+
+## Pull requests from forks
+
+GitHub issues no OIDC token to a workflow run for a pull request from a fork, whatever the
+workflow's `permissions` say. On those runs the action still scans on the runner and still
+enforces `fail-on` and `fail-on-new` (the step exits 2 on a committed credential), uploads nothing,
+says so in a warning, and reports `delivery-status: failed`. It does not fail the job for the
+missing upload, even with `fail-on-error: true`, because the contributor cannot grant the
+permission. The findings reach Visiblaze when the change is merged and the branch run uploads them.
 
 ## When it finds something
 
