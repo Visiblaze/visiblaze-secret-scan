@@ -516,6 +516,15 @@ runs:
                 echo "visiblaze-secret: comparing against merge base ${MERGE_BASE}"
                 ARGS+=(-base-dir "${BASE_SCAN_DIR}" -base-sha "${MERGE_BASE}")
                 [ -n "${BASE_REF:-}" ] && ARGS+=(-base-ref "${BASE_REF:-}")
+                # Every commit of the pull request, not only its head: a credential committed and
+                # removed again within it is still in the history and must be rotated (SCRUM-18814).
+                # Only with a scanner that knows the flag, so an older pinned scanner keeps working.
+                case "$HELP_OUT" in
+                  *-history-head*)
+                    HIST_HEAD="$(git -C "${GH_WORKSPACE}" rev-parse --verify --quiet "${MB_HEAD}^{commit}" 2>/dev/null || true)"
+                    [ -n "${HIST_HEAD}" ] && ARGS+=(-history-head "${HIST_HEAD}")
+                    ;;
+                esac
               else
                 # The path did not exist on the base — a newly added subtree. Everything in it is
                 # genuinely new, but saying so from an empty baseline is a guess dressed as a
